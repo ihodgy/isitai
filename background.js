@@ -47,6 +47,16 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   const imageUrl = info.srcUrl;
   if (!imageUrl) return;
 
+  // Inject content script if not already present — covers tabs that were open before the
+  // extension was installed or reloaded. content.js guards itself against double-injection.
+  try {
+    await chrome.scripting.insertCSS({ target: { tabId: tab.id }, files: ["overlay.css"] });
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
+  } catch (e) {
+    // Tab doesn't allow scripting (e.g. chrome:// pages)
+    return;
+  }
+
   // Tell the content script to show a loading overlay on the clicked image
   await chrome.scripting.executeScript({
     target: { tabId: tab.id },
