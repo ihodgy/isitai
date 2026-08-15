@@ -34,10 +34,12 @@ Respond ONLY with a JSON object — no markdown, no extra text:
 verdict must be exactly "ai" or "human". confidence is 0.0–1.0.`;
 
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.contextMenus.create({
-    id: MENU_ITEM_ID,
-    title: "Check if AI-generated",
-    contexts: ["image"],
+  chrome.contextMenus.removeAll(() => {
+    chrome.contextMenus.create({
+      id: MENU_ITEM_ID,
+      title: "Check if AI-generated",
+      contexts: ["image"],
+    });
   });
 });
 
