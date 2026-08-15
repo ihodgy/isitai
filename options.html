@@ -20,7 +20,7 @@
       border: 1px solid rgba(255,255,255,0.08);
       border-radius: 16px;
       padding: 36px 40px;
-      width: 440px;
+      width: min(520px, calc(100vw - 32px));
       box-shadow: 0 8px 40px rgba(0,0,0,0.5);
     }
     .logo {
@@ -47,7 +47,8 @@
       color: rgba(255,255,255,0.7);
       margin-bottom: 8px;
     }
-    input[type="text"], input[type="password"] {
+    .field { margin-top: 22px; }
+    input[type="password"], input[type="search"], select {
       width: 100%;
       background: rgba(255,255,255,0.05);
       border: 1px solid rgba(255,255,255,0.12);
@@ -58,7 +59,12 @@
       outline: none;
       transition: border-color 0.2s;
     }
-    input:focus {
+    select {
+      appearance: auto;
+      min-height: 42px;
+    }
+    .model-search { margin-bottom: 8px; }
+    input:focus, select:focus {
       border-color: #60a5fa;
     }
     .hint {
@@ -83,6 +89,27 @@
       transition: background 0.2s;
     }
     button:hover { background: #2563eb; }
+    button.secondary {
+      width: auto;
+      margin: 0;
+      padding: 6px 9px;
+      background: rgba(255,255,255,0.08);
+      color: rgba(255,255,255,0.72);
+      font-size: 12px;
+    }
+    button.secondary:hover { background: rgba(255,255,255,0.14); }
+    .model-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 8px;
+    }
+    .model-status {
+      color: rgba(255,255,255,0.4);
+      font-size: 12px;
+      line-height: 1.35;
+    }
     .status {
       margin-top: 12px;
       text-align: center;
@@ -99,14 +126,33 @@
     <h1>Is It AI?</h1>
     <p class="sub">Chrome extension settings</p>
 
-    <label for="apiKey">Google Gemini API Key</label>
-    <input type="password" id="apiKey" placeholder="Paste your Gemini API key here…" autocomplete="off" />
+    <label for="apiKey">OpenRouter API Key</label>
+    <input type="password" id="apiKey" placeholder="Paste your OpenRouter API key here…" autocomplete="off" />
     <p class="hint">
-      Get a free key at <a href="https://aistudio.google.com/apikey" target="_blank">Google AI Studio</a>.
-      Free tier includes generous monthly quota with no credit card required.
+      Create a key in your <a href="https://openrouter.ai/settings/keys" target="_blank">OpenRouter settings</a>.
+      Usage and pricing depend on the selected model.
     </p>
 
-    <button id="save">Save</button>
+    <div class="field">
+      <label for="visionModel">Vision model</label>
+      <input
+        type="search"
+        class="model-search"
+        id="modelSearch"
+        placeholder="Search by model name or ID…"
+        autocomplete="off"
+        aria-label="Search vision models"
+      />
+      <select id="visionModel" disabled>
+        <option value="openrouter/auto">OpenRouter Auto — recommended</option>
+      </select>
+      <div class="model-row">
+        <span class="model-status" id="modelStatus">Loading structured-output vision models…</span>
+        <button type="button" class="secondary" id="refreshModels">Refresh models</button>
+      </div>
+    </div>
+
+    <button id="save">Save OpenRouter settings</button>
     <div class="status" id="status"></div>
   </div>
   <script src="options.js"></script>

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Is It AI?",
-  "version": "1.0.0",
-  "description": "Right-click any image to check if it was AI-generated.",
+  "version": "1.1.5",
+  "description": "Right-click any image and analyze it with a selectable OpenRouter vision model.",
   "permissions": [
     "contextMenus",
     "storage",

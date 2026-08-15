@@ -30,7 +30,7 @@ if (!window.__isitai_initialized) {
           <div class="isitai-card isitai-error">
             <div class="isitai-icon">🔑</div>
             <div class="isitai-message">No API key set.</div>
-            <a class="isitai-link" href="${chrome.runtime.getURL("options.html")}" target="_blank">Open settings</a>
+            <button class="isitai-link isitai-open-options">Open settings</button>
             <button class="isitai-close">✕</button>
           </div>
         `;
@@ -74,11 +74,20 @@ if (!window.__isitai_initialized) {
         removeOverlay(imageUrl);
       });
 
+      overlay.querySelector(".isitai-open-options")?.addEventListener("click", () => {
+        chrome.runtime.sendMessage({ action: "openOptions" });
+      });
+
       attachOverlay(img, overlay, imageUrl);
     };
 
     function findImage(imageUrl) {
-      const decoded = decodeURIComponent(imageUrl);
+      let decoded = imageUrl;
+      try {
+        decoded = decodeURIComponent(imageUrl);
+      } catch (_error) {
+        // Some sites use literal percent signs in image URLs. Keep the original URL.
+      }
       return (
         document.querySelector(`img[src="${CSS.escape(imageUrl)}"]`) ||
         document.querySelector(`img[src="${CSS.escape(decoded)}"]`) ||
@@ -125,7 +134,10 @@ if (!window.__isitai_initialized) {
     }
 
     function escHtml(str) {
-      return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      return String(str ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
     }
   })();
 }

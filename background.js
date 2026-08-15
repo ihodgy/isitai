@@ -1,37 +1,79 @@
 const MENU_ITEM_ID = "isitai-check";
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
+const DEFAULT_VISION_MODEL = "openrouter/auto";
+const RETRYABLE_STATUSES = new Set([429, 503]);
+const MAX_REQUEST_ATTEMPTS = 2;
+const MAX_AUTO_RETRY_DELAY_MS = 2_000;
+const OPENROUTER_TIMEOUT_MS = 25_000;
+const IMAGE_DOWNLOAD_TIMEOUT_MS = 10_000;
+const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
+const DETECTION_RESPONSE_FORMAT = {
+  type: "json_schema",
+  json_schema: {
+    name: "image_authenticity_assessment",
+    strict: true,
+    schema: {
+      type: "object",
+      properties: {
+        verdict: {
+          type: "string",
+          enum: ["ai", "human"],
+          description: "Whether the image is more likely AI-generated or human-created.",
+        },
+        confidence: {
+          type: "number",
+          minimum: 0,
+          maximum: 1,
+          description: "Confidence in the verdict from 0 to 1.",
+        },
+        reasoning: {
+          type: "string",
+          description: "A concise description of the specific visual evidence.",
+        },
+      },
+      required: ["verdict", "confidence", "reasoning"],
+      additionalProperties: false,
+    },
+  },
+};
 
-// Update this string if Google releases a newer model ID
-const GEMINI_MODEL = "gemini-3-flash-preview";
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+const DETECTION_PROMPT = `You are a careful image-forensics analyst. Estimate whether this image is more likely AI-generated or human-created. Modern generators often produce clean images without classic finger or text defects, so the absence of a single obvious mistake is not evidence that an image is human-made.
 
-const DETECTION_PROMPT = `You are an expert forensic analyst specializing in AI-generated image detection. Analyze this image carefully.
+Evaluate the whole image and combine independent signals, including:
+- inconsistent anatomy, object geometry, perspective, scale, shadows, reflections, lighting, or occlusion
+- boundaries where hair, jewelry, clothing, hands, or objects merge, disappear, or change structure
+- locally repeated micro-patterns, texture/detail collapse, implausible fine detail, or inconsistent depth of field
+- malformed typography, symbols, architecture, background objects, or semantic relationships
+- generation-like visual regularities across faces, skin, catchlights, foliage, fabric, and background detail
+- visible generator labels, watermarks, or Content Credentials that explicitly identify AI generation
 
-IMPORTANT BIAS CORRECTION: You have a tendency to over-call images as AI-generated. Counteract this.
-Professional photography, studio portraits, digital art, 3D renders, stock photos, and heavily edited
-images are NOT AI-generated. Only call something AI if you find specific, hard evidence.
+Do not treat beauty, smooth skin, vivid color, dramatic lighting, photorealism, digital art, 3D rendering, retouching, or an unusual style as proof by themselves. Conversely, do not require an anatomical impossibility or visible watermark before choosing "ai". Weigh multiple moderate signals when no single decisive artifact exists.
 
-Hard evidence of AI generation (require at least one):
-- Anatomical impossibilities: wrong number of fingers/teeth, merged or extra limbs, impossible joint angles
-- Text artifacts: garbled, floating, nonsensical, or morphing letters within the image
-- Physical impossibilities: objects that violate gravity or perspective in surreal ways
-- Background incoherence: repeating patterns, objects that dissolve or merge into surroundings
-- Known AI watermarks or signatures visible in the image
-- Facial asymmetry combined with waxy or pore-less skin AND unnatural catchlights simultaneously
-
-NOT sufficient evidence on its own (do not use these alone):
-- Image looks "too perfect" or "too clean"
-- Smooth skin (could be studio lighting, makeup, or retouching)
-- Vivid or dramatic colors (could be editing or HDR)
-- Surreal or artistic style (could be intentional art direction)
-- Photorealistic quality (cameras and skilled photographers can achieve this)
-- Subject is attractive or idealized
-
-Default to "human" when uncertain. Only use "ai" when you have concrete, specific evidence from the hard evidence list above.
-Set confidence below 0.7 if you have any doubt.
+Choose the more likely source even when uncertain, and express uncertainty through confidence:
+- 0.50–0.59: essentially uncertain
+- 0.60–0.74: tentative, with limited or mixed evidence
+- 0.75–0.89: multiple consistent signals or one strong signal
+- 0.90–1.00: decisive visual or provenance evidence
 
 Respond ONLY with a JSON object — no markdown, no extra text:
-{"verdict":"ai","confidence":0.95,"reasoning":"Cite the specific artifact you found, e.g. 'Left hand has 7 fingers and text in background is garbled.'"}
+{"verdict":"ai","confidence":0.82,"reasoning":"Briefly cite the strongest specific signals and any important counterevidence."}
 verdict must be exactly "ai" or "human". confidence is 0.0–1.0.`;
+
+const GENERATOR_METADATA_MARKERS = [
+  ["Adobe Firefly", ["adobe firefly"]],
+  ["Automatic1111", ["automatic1111", "stable-diffusion-webui"]],
+  ["ComfyUI", ["comfyui"]],
+  ["DALL-E", ["dall-e", "dall·e"]],
+  ["Fooocus", ["fooocus"]],
+  ["Ideogram", ["ideogram ai", "ideogram.ai"]],
+  ["InvokeAI", ["invokeai"]],
+  ["Leonardo AI", ["leonardo.ai", "leonardo ai"]],
+  ["Midjourney", ["midjourney"]],
+  ["NovelAI", ["novelai"]],
+  ["OpenAI image generation", ["openai image generation", "gpt-image-1"]],
+  ["Recraft", ["recraft.ai"]],
+  ["Stable Diffusion", ["stable diffusion", "stablediffusion"]],
+];
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.removeAll(() => {
@@ -43,113 +85,336 @@ chrome.runtime.onInstalled.addListener(() => {
   });
 });
 
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg?.action === "openOptions") chrome.runtime.openOptionsPage();
+});
+
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId !== MENU_ITEM_ID) return;
 
   const imageUrl = info.srcUrl;
-  if (!imageUrl) return;
+  const tabId = tab?.id;
+  if (!imageUrl || !Number.isInteger(tabId)) return;
 
-  // Inject content script if not already present — covers tabs that were open before the
-  // extension was installed or reloaded. content.js guards itself against double-injection.
+  // Covers tabs that were open before the extension was installed or reloaded.
+  // A tab can disappear or navigate between any two awaited calls, so treat script
+  // injection failure as an expected race instead of recording an extension error.
   try {
-    await chrome.scripting.insertCSS({ target: { tabId: tab.id }, files: ["overlay.css"] });
-    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
-  } catch (e) {
-    // Tab doesn't allow scripting (e.g. chrome:// pages)
+    await chrome.scripting.insertCSS({ target: { tabId }, files: ["overlay.css"] });
+    await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+  } catch (_error) {
     return;
   }
 
-  // Tell the content script to show a loading overlay on the clicked image
-  await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    func: showLoadingOverlay,
-    args: [imageUrl],
-  });
+  if (!(await executeInTab(tabId, showLoadingOverlay, [imageUrl]))) return;
 
-  const { apiKey } = await chrome.storage.sync.get("apiKey");
-
-  if (!apiKey) {
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: showResultOverlay,
-      args: [imageUrl, null, "no-key"],
-    });
+  let openRouterApiKey;
+  let visionModel;
+  let visionModelSupportsStructuredOutputs;
+  try {
+    ({ openRouterApiKey, visionModel, visionModelSupportsStructuredOutputs } = await chrome.storage.sync.get([
+      "openRouterApiKey",
+      "visionModel",
+      "visionModelSupportsStructuredOutputs",
+    ]));
+  } catch (error) {
+    await executeInTab(tabId, showResultOverlay, [
+      imageUrl,
+      null,
+      `Could not read settings: ${errorMessage(error)}`,
+    ]);
     return;
   }
 
-  try {
-    const result = await checkImage(imageUrl, apiKey);
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: showResultOverlay,
-      args: [imageUrl, result, null],
-    });
-  } catch (err) {
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: showResultOverlay,
-      args: [imageUrl, null, err.message],
-    });
+  if (!openRouterApiKey) {
+    await executeInTab(tabId, showResultOverlay, [imageUrl, null, "no-key"]);
+    return;
   }
+
+  let result = null;
+  let errorMsg = null;
+  const selectedVisionModel = visionModelSupportsStructuredOutputs && visionModel
+    ? visionModel
+    : DEFAULT_VISION_MODEL;
+  try {
+    result = await checkImage(
+      imageUrl,
+      openRouterApiKey,
+      selectedVisionModel
+    );
+  } catch (error) {
+    errorMsg = errorMessage(error);
+  }
+
+  // If the tab navigated while OpenRouter was working, there is nowhere to show the
+  // result. This is normal and should not create a Chrome "Extension Error".
+  await executeInTab(tabId, showResultOverlay, [imageUrl, result, errorMsg]);
 });
 
-async function checkImage(imageUrl, apiKey) {
-  // Fetch the image and convert to base64 for Gemini inline data
-  let base64, mimeType;
+async function executeInTab(tabId, func, args) {
+  try {
+    await chrome.scripting.executeScript({ target: { tabId }, func, args });
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function checkImage(imageUrl, apiKey, visionModel) {
+  // Fetch the image and convert it to a data URL accepted by OpenRouter vision models.
+  let base64, mimeType, imageBytes;
 
   if (imageUrl.startsWith("data:")) {
-    // Already a data URL — split it apart
-    const [header, data] = imageUrl.split(",");
+    // Already a data URL — decode it once so we can inspect embedded provenance.
+    const separator = imageUrl.indexOf(",");
+    if (separator < 0) throw new Error("Invalid image data URL");
+    const header = imageUrl.slice(0, separator);
+    const data = imageUrl.slice(separator + 1);
     mimeType = header.match(/data:([^;]+)/)?.[1] ?? "image/jpeg";
-    base64 = data;
+    if (/;base64(?:;|$)/i.test(header)) {
+      base64 = data.replace(/\s/g, "");
+      imageBytes = base64ToBytes(base64);
+    } else {
+      imageBytes = new TextEncoder().encode(decodeURIComponent(data));
+      base64 = arrayBufferToBase64(imageBytes);
+    }
+    if (imageBytes.byteLength > MAX_IMAGE_BYTES) throw imageTooLargeError();
   } else {
-    const imgRes = await fetch(imageUrl);
-    if (!imgRes.ok) throw new Error(`Could not fetch image (HTTP ${imgRes.status})`);
-    const blob = await imgRes.blob();
+    const blob = await fetchImageBlob(imageUrl);
+    if (blob.size > MAX_IMAGE_BYTES) throw imageTooLargeError();
     mimeType = blob.type || "image/jpeg";
 
-    // Safe base64 encoding that handles large buffers without stack overflow
     const buffer = await blob.arrayBuffer();
-    const bytes = new Uint8Array(buffer);
-    let binary = "";
-    for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
-    base64 = btoa(binary);
+    imageBytes = new Uint8Array(buffer);
+    base64 = arrayBufferToBase64(buffer);
   }
 
-  const res = await fetch(`${GEMINI_URL}?key=${apiKey}`, {
+  const metadata = inspectEmbeddedMetadata(imageBytes);
+  if (metadata.generators.length > 0) {
+    const generatorList = metadata.generators.join(", ");
+    const c2paNote = metadata.hasC2paMarker ? " A C2PA/Content Credentials marker is also present." : "";
+    return {
+      verdict: "ai",
+      confidence: 0.98,
+      reasoning: `Embedded generator metadata identifies ${generatorList}.${c2paNote} This is strong file-level provenance, though the extension has not cryptographically validated it.`,
+    };
+  }
+
+  const imageDataUrl = `data:${mimeType};base64,${base64}`;
+
+  const request = {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Authorization": `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+      "X-OpenRouter-Metadata": "enabled",
+      "X-OpenRouter-Title": "Is It AI?",
+    },
     body: JSON.stringify({
-      contents: [{
-        parts: [
-          { inlineData: { mimeType, data: base64 } },
-          { text: DETECTION_PROMPT },
+      model: visionModel,
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: DETECTION_PROMPT },
+          { type: "image_url", image_url: { url: imageDataUrl } },
         ],
       }],
-      generationConfig: {
-        temperature: 0.1,
-        responseMimeType: "application/json",
+      response_format: DETECTION_RESPONSE_FORMAT,
+      provider: {
+        allow_fallbacks: true,
+        require_parameters: true,
       },
     }),
-  });
+  };
+
+  const res = await fetchWithRetry(OPENROUTER_URL, request);
 
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Gemini API error ${res.status}: ${text}`);
+    const detail = await responseError(res, visionModel);
+    throw new Error(`OpenRouter API error ${res.status}: ${detail}`);
   }
 
   const json = await res.json();
-  const raw = json.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!raw) throw new Error("Empty response from Gemini");
+  const content = json.choices?.[0]?.message?.content;
+  const raw = typeof content === "string"
+    ? content
+    : Array.isArray(content)
+      ? content.map((part) => part?.text || "").join("")
+      : "";
+  if (!raw) throw new Error("Empty response from OpenRouter");
 
-  // Gemini sometimes wraps JSON in markdown fences even with responseMimeType set
-  const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
-  const parsed = JSON.parse(cleaned);
+  const parsed = parseDetectionResult(raw);
 
   if (!parsed.verdict || !["ai", "human"].includes(parsed.verdict)) {
-    throw new Error("Unexpected response shape from Gemini");
+    throw new Error("Unexpected response shape from the selected vision model");
   }
   return parsed;
+}
+
+function parseDetectionResult(raw) {
+  // Models may wrap the object in markdown or add a short preamble despite the prompt.
+  const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+  try {
+    return JSON.parse(cleaned);
+  } catch (_error) {
+    const start = cleaned.indexOf("{");
+    const end = cleaned.lastIndexOf("}");
+    if (start >= 0 && end > start) return JSON.parse(cleaned.slice(start, end + 1));
+    throw new Error("The selected vision model did not return JSON");
+  }
+}
+
+async function fetchWithRetry(url, request) {
+  let lastResponse;
+  let lastError;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), OPENROUTER_TIMEOUT_MS);
+
+  try {
+    for (let attempt = 0; attempt < MAX_REQUEST_ATTEMPTS; attempt += 1) {
+      try {
+        lastResponse = await fetch(url, { ...request, signal: controller.signal });
+        if (!RETRYABLE_STATUSES.has(lastResponse.status)) return lastResponse;
+        if (attempt === MAX_REQUEST_ATTEMPTS - 1) return lastResponse;
+
+        const delayMs = retryDelayMs(lastResponse, attempt);
+        if (delayMs > MAX_AUTO_RETRY_DELAY_MS) return lastResponse;
+        await wait(delayMs);
+      } catch (error) {
+        if (controller.signal.aborted) {
+          throw new Error("OpenRouter request timed out after 25 seconds");
+        }
+        lastError = error;
+        if (attempt === MAX_REQUEST_ATTEMPTS - 1) throw error;
+        await wait(1_000);
+      }
+    }
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  if (lastResponse) return lastResponse;
+  throw lastError || new Error("OpenRouter request failed");
+}
+
+async function fetchImageBlob(url) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), IMAGE_DOWNLOAD_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) throw new Error(`Could not fetch image (HTTP ${response.status})`);
+    return await response.blob();
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error("Image download timed out after 10 seconds");
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+function arrayBufferToBase64(buffer) {
+  const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+  const chunks = [];
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    chunks.push(String.fromCharCode(...bytes.subarray(offset, offset + chunkSize)));
+  }
+  return btoa(chunks.join(""));
+}
+
+function base64ToBytes(base64) {
+  let binary;
+  try {
+    binary = atob(base64);
+  } catch (_error) {
+    throw new Error("Invalid base64 image data URL");
+  }
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+function inspectEmbeddedMetadata(bytes) {
+  // PNG text chunks, JPEG XMP, and C2PA/JUMBF labels are stored as searchable
+  // byte strings. Removing NUL bytes also makes common UTF-16 metadata searchable.
+  const text = new TextDecoder("latin1").decode(bytes).replace(/\0/g, "").toLowerCase();
+  const generators = [];
+
+  for (const [name, markers] of GENERATOR_METADATA_MARKERS) {
+    if (markers.some((marker) => text.includes(marker))) generators.push(name);
+  }
+
+  const hasDiffusionParameters = text.includes("steps:")
+    && text.includes("sampler:")
+    && (text.includes("cfg scale:") || text.includes("model hash:") || text.includes("denoising strength:"));
+  if (hasDiffusionParameters && !generators.includes("Stable Diffusion")) {
+    generators.push("Stable Diffusion generation parameters");
+  }
+
+  const hasC2paMarker = text.includes("c2pa") || text.includes("content credentials");
+  return { generators, hasC2paMarker };
+}
+
+function imageTooLargeError() {
+  return new Error("Image is larger than 15 MB; choose a smaller image");
+}
+
+function retryDelayMs(response, attempt) {
+  return retryAfterHeaderMs(response) ?? 1_000 * (2 ** attempt);
+}
+
+function retryAfterHeaderMs(response) {
+  const value = response.headers.get("Retry-After");
+  if (!value) return null;
+
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000;
+
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : null;
+}
+
+function wait(delayMs) {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+async function responseError(response, requestedModel) {
+  const text = await response.text();
+  try {
+    const json = JSON.parse(text);
+    const error = json?.error || {};
+    const metadata = error?.metadata || {};
+    const routing = json?.openrouter_metadata || {};
+    const selectedEndpoint = routing?.endpoints?.available?.find((endpoint) => endpoint?.selected);
+    const provider = metadata.provider_name || json.provider || selectedEndpoint?.provider;
+    const errorType = metadata.error_type;
+    const providerCode = metadata.provider_code;
+    const retryAfterMs = retryAfterHeaderMs(response);
+    const details = [String(error.message || json?.message || text).slice(0, 500)];
+
+    if (errorType) details.push(`Type: ${errorType}`);
+    if (providerCode) details.push(`Provider code: ${providerCode}`);
+    if (provider) details.push(`Provider: ${provider}`);
+    details.push(`Model: ${routing.requested || requestedModel}`);
+
+    if (response.status === 429) {
+      if (retryAfterMs !== null && retryAfterMs > MAX_AUTO_RETRY_DELAY_MS) {
+        details.push(`Retry after ${Math.ceil(retryAfterMs / 1_000)}s`);
+      } else {
+        details.push("Rate limited after an automatic retry; try again or choose OpenRouter Auto/another model");
+      }
+    }
+
+    return details.join(" · ");
+  } catch (_error) {
+    return text.slice(0, 500) || response.statusText || "Unknown error";
+  }
 }
 
 // These functions are serialized and injected into the page tab —
